@@ -1,5 +1,4 @@
 import express from 'express';
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type, FunctionDeclaration } from '@google/genai';
 import crypto from 'crypto';
 import fs from 'fs';
@@ -11,12 +10,12 @@ dotenv.config();
 const app = express();
 app.use(express.json({ limit: '15mb' }));
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const WORKSPACE_STORE_PATH = path.resolve(process.cwd(), '.symvibe-workspace.json');
 
 function getGeminiClient(): GoogleGenAI {
   return new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY,
+    apiKey: process.env.GEMINI_API_KEY || 'missing-api-key',
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -26,10 +25,21 @@ function getGeminiClient(): GoogleGenAI {
 }
 
 function computeSha256(input: string): string {
-  return crypto.createHash('sha256').update(input, 'utf8').digest('hex');
+  return crypto.createHash('sha256').update(String(input || ''), 'utf8').digest('hex');
 }
 
+// Health check route for Cloud Run startup/liveness probes
+app.get('/api/health', (_req, res) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 // Hardened AgentOS Gateway State (closing the 3 gaps in AgentOS README)
+const perAgentQuotas: Record<string, { used: number; limit: number }> = {
+  'gemini-4-argon': { used: 7, limit: 25 },
+  codex: { used: 4, limit: 20 },
+  'claude-code': { used: 3, limit: 15 },
+};
+
 const agentOsState = {
   persistentStorage: {
     enabled: true,
@@ -51,11 +61,7 @@ const agentOsState = {
     currentWindowRequests: 14,
     blockedRequests: 0,
     windowStartMs: Date.now(),
-    perAgentQuotas: {
-      'gemini-4-argon': { used: 7, limit: 25 },
-      codex: { used: 4, limit: 20 },
-      'claude-code': { used: 3, limit: 15 },
-    } as Record<string, { used: number; limit: number }>,
+    perAgentQuotas,
   },
 };
 
@@ -205,7 +211,7 @@ app.post('/api/gateway/github-sync', async (req, res) => {
   const { repoUrl = 'https://github.com/dev4-gpt/local-AgenticOS', branch = 'main' } = req.body || {};
   checkAndRecordRateLimit('codex');
 
-  const match = repoUrl.match(/github\.com\/([^/]+)\/([^/.\s]+)/i);
+  const match = String(repoUrl).match(/github\.com\/([^/]+)\/([^/.\s]+)/i);
   const owner = match?.[1] || 'dev4-gpt';
   const repo = match?.[2] || 'local-AgenticOS';
 
@@ -317,7 +323,7 @@ app.post('/api/gateway/github-sync', async (req, res) => {
 
 // 4. Deterministic REA (Reverse Engineer Anything) + ResearchOS SHA-256 Provenance + Graphify Engine
 function buildDeterministicHexPreview(input: string): string[] {
-  const buf = Buffer.from(input.slice(0, 128), 'utf8');
+  const buf = Buffer.from(String(input || '').slice(0, 128), 'utf8');
   const lines: string[] = [];
   for (let offset = 0; offset < Math.min(buf.length, 64); offset += 16) {
     const slice = buf.subarray(offset, offset + 16);
@@ -346,12 +352,11 @@ app.post('/api/rea/inspect', async (req, res) => {
   let deterministicSource = `${targetType}::${targetInput}::${rawSampleContent}`;
   const deterministicFindings: string[] = [];
 
-  // If targetType is URL and looks like http(s), try a real lightweight HTTP inspection
-  if (targetType === 'url' && /^https?:\/\//i.test(targetInput.trim())) {
+  if (targetType === 'url' && /^https?:\/\//i.test(String(targetInput).trim())) {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 4500);
-      const urlRes = await fetch(targetInput.trim(), {
+      const urlRes = await fetch(String(targetInput).trim(), {
         signal: controller.signal,
         headers: { 'User-Agent': 'REA-MCP-Inspector/1.0' },
       });
@@ -360,7 +365,7 @@ app.post('/api/rea/inspect', async (req, res) => {
       deterministicSource += `::HTTP_${urlRes.status}::${htmlText.slice(0, 1500)}`;
 
       const serverHeader = urlRes.headers.get('server') || urlRes.headers.get('x-powered-by') || 'standard-edge';
-      deterministicFindings.push(`HTTP ${urlRes.status} response from ${targetInput.trim()} (Server: ${serverHeader})`);
+      deterministicFindings.push(`HTTP ${urlRes.status} response from ${String(targetInput).trim()} (Server: ${serverHeader})`);
 
       const scriptMatches = Array.from(htmlText.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)).map((m) => m[1]);
       if (scriptMatches.length > 0) {
@@ -374,7 +379,6 @@ app.post('/api/rea/inspect', async (req, res) => {
       deterministicFindings.push(`URL probe note: ${fetchErr?.message || 'Analyzed target signature offline'}`);
     }
   } else {
-    // Extract deterministic strings, routes, and symbols from rawSampleContent
     const routes = Array.from((rawSampleContent + ' ' + targetInput).matchAll(/\/api\/[a-zA-Z0-9/_-]+/g)).map((m) => m[0]);
     if (routes.length > 0) {
       deterministicFindings.push(`Extracted API routes: ${Array.from(new Set(routes)).join(', ')}`);
@@ -552,9 +556,9 @@ app.post('/api/agent/execute', async (req, res) => {
     });
   }
 
-  const trimmed = input.trim();
+  const trimmed = String(input || '').trim();
+  const lockedList: string[] = Array.isArray(otherLockedFiles) ? otherLockedFiles : [];
 
-  // Handle deterministic fast CLI commands inside the sandboxed terminal
   if (trimmed === 'help' || trimmed === 'rea-cli --help') {
     return res.json({
       kind: 'output',
@@ -586,7 +590,7 @@ app.post('/api/agent/execute', async (req, res) => {
 
   if (trimmed.startsWith('lock ')) {
     const fileToLock = trimmed.slice(5).trim();
-    const conflict = (otherLockedFiles as string[]).includes(fileToLock);
+    const conflict = lockedList.includes(fileToLock);
     return res.json({
       kind: conflict ? 'conflict-alert' : 'mcp-tool',
       modelUsed: runner,
@@ -605,12 +609,12 @@ app.post('/api/agent/execute', async (req, res) => {
     const systemPrompt = `You are acting as the "${runner}" coding agent (${roleTitle}) on the Symvibe + REA spatial board inside Veloce AgenticOS.
 You have access to MCP tools for REA symbol inspection, Veloce AgenticOS memory syncing, and Claude Swarm file locking.
 Current Repomix Repository Context:
-${repomixContext.slice(0, 2000)}
+${String(repomixContext || '').slice(0, 2000)}
 
 Current REA Provenance Summary:
-${reaEvidenceSummary.slice(0, 1500)}
+${String(reaEvidenceSummary || '').slice(0, 1500)}
 
-Files currently locked by OTHER agents on the board: ${(otherLockedFiles as string[]).join(', ') || 'none'}.
+Files currently locked by OTHER agents on the board: ${lockedList.join(', ') || 'none'}.
 Respond concisely (under 140 words) with concrete technical findings, TypeScript implementation snippets, or architectural actions.`;
 
     const result = await generateWithArgonOrFallback({
@@ -630,7 +634,7 @@ Respond concisely (under 140 words) with concrete technical findings, TypeScript
     if (firstToolCall) {
       if (firstToolCall.name === 'swarm_acquire_file_lock') {
         const candidateFile = String((firstToolCall.args as any)?.filePath || 'src/adapters/symvibe-spatial-gateway.ts');
-        if ((otherLockedFiles as string[]).includes(candidateFile)) {
+        if (lockedList.includes(candidateFile)) {
           conflictDetected = true;
           toolSummaryText = `[SWARM CONFLICT ALERT] Attempted to lock "${candidateFile}", which is already locked by another agent session!\n`;
         } else {
@@ -778,7 +782,6 @@ Generate a concrete execution plan containing:
 
     const planData = JSON.parse(result.text.trim());
 
-    // Synthesize spoken audio reply using gemini-3.8-flash-lite-tts (unary returns complete WAV audio/wav)
     let wavBase64: string | null = null;
     try {
       const ai = getGeminiClient();
@@ -917,7 +920,7 @@ app.post('/api/gateway/github-push', async (req, res) => {
     });
   }
 
-  const match = repoUrl.match(/github\.com\/([^/]+)\/([^/.\s]+)/i);
+  const match = String(repoUrl).match(/github\.com\/([^/]+)\/([^/.\s]+)/i);
   const owner = match?.[1] || 'dev4-gpt';
   const repo = match?.[2] || 'local-AgenticOS';
   const ghHeaders = {
@@ -928,7 +931,6 @@ app.post('/api/gateway/github-push', async (req, res) => {
   };
 
   try {
-    // 1. Get default branch SHA
     const repoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers: ghHeaders });
     if (!repoRes.ok) {
       const errData: any = await repoRes.json().catch(() => ({}));
@@ -946,9 +948,8 @@ app.post('/api/gateway/github-push', async (req, res) => {
     const refData: any = await refRes.json();
     const baseCommitSha = refData.object.sha;
 
-    // 2. Create tree with all project files under targetSubdir (or root if empty)
     const files = collectProjectFiles();
-    const cleanPrefix = targetSubdir.replace(/^\/+|\/+$/g, '');
+    const cleanPrefix = String(targetSubdir || '').replace(/^\/+|\/+$/g, '');
     const treeItems = files.map((f) => ({
       path: cleanPrefix ? `${cleanPrefix}/${f.path}` : f.path,
       mode: '100644',
@@ -970,7 +971,6 @@ app.post('/api/gateway/github-push', async (req, res) => {
     }
     const treeCreated: any = await treeRes.json();
 
-    // 3. Create commit
     const commitRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/commits`, {
       method: 'POST',
       headers: ghHeaders,
@@ -985,7 +985,6 @@ app.post('/api/gateway/github-push', async (req, res) => {
     }
     const commitCreated: any = await commitRes.json();
 
-    // 4. Create or update target branch ref
     const updateRefRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${branch}`, {
       method: 'PATCH',
       headers: ghHeaders,
@@ -1026,6 +1025,7 @@ app.post('/api/gateway/github-push', async (req, res) => {
 
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
