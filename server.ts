@@ -4,11 +4,75 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
+import { fetchPublic } from './netguard.ts';
 
 dotenv.config();
 
 const app = express();
+app.disable('x-powered-by');
 app.use(express.json({ limit: '15mb' }));
+
+// ---- Access control -------------------------------------------------------------------------------
+// Every /api route except /api/health needs the access key (SYMVIBE_API_KEY), sent as
+// "Authorization: Bearer <key>" or "x-api-key". With no key configured the server only answers direct
+// connections from the same machine (no proxy in front), so a deployed copy is closed until a key is set.
+const ACCESS_KEY = process.env.SYMVIBE_API_KEY || '';
+
+function isDirectLocalRequest(req: express.Request): boolean {
+  const addr = req.socket.remoteAddress || '';
+  const local = addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+  return local && !req.headers['x-forwarded-for'] && !req.headers['forwarded'];
+}
+
+function accessKeyMatches(given: string): boolean {
+  const a = crypto.createHash('sha256').update(given).digest();
+  const b = crypto.createHash('sha256').update(ACCESS_KEY).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+app.use('/api', (req, res, next) => {
+  if (req.path === '/health') return next();
+  if (!ACCESS_KEY) {
+    if (isDirectLocalRequest(req)) return next();
+    return res.status(503).json({
+      error: 'No access key is configured. Set SYMVIBE_API_KEY (AI Studio: Settings > Secrets) before using this server from another machine.',
+    });
+  }
+  const authorization = String(req.headers['authorization'] || '');
+  const given = authorization.startsWith('Bearer ') ? authorization.slice(7) : String(req.headers['x-api-key'] || '');
+  if (given && accessKeyMatches(given)) return next();
+  return res.status(401).json({ error: 'Access key required.' });
+});
+
+// ---- GitHub safety --------------------------------------------------------------------------------
+// Pushes may only go to repositories listed in GITHUB_ALLOWED_REPOS (comma separated owner/repo) and only to
+// branches that start with GITHUB_PUSH_BRANCH_PREFIX. The default branch is never touched.
+const GITHUB_ALLOWED_REPOS = (process.env.GITHUB_ALLOWED_REPOS || 'dev4-gpt/local-AgenticOS')
+  .split(',')
+  .map((x) => x.trim().toLowerCase())
+  .filter(Boolean);
+const GITHUB_PUSH_BRANCH_PREFIX = process.env.GITHUB_PUSH_BRANCH_PREFIX || 'feat/symvibe';
+
+function parseGithubRepo(repoUrl: unknown): { owner: string; repo: string } | null {
+  const m = String(repoUrl).trim().match(/^https:\/\/github\.com\/([A-Za-z0-9._-]{1,100})\/([A-Za-z0-9._-]{1,100}?)(?:\.git)?\/?$/);
+  return m ? { owner: m[1] as string, repo: m[2] as string } : null;
+}
+
+function isSafeBranchName(name: unknown): name is string {
+  return (
+    typeof name === 'string' &&
+    /^[A-Za-z0-9._\/-]{1,100}$/.test(name) &&
+    !name.includes('..') &&
+    !name.startsWith('/') &&
+    !name.startsWith('-') &&
+    !name.endsWith('/') &&
+    !name.endsWith('.lock')
+  );
+}
+
+function isSafeSubdir(dir: unknown): dir is string {
+  return typeof dir === 'string' && /^[A-Za-z0-9._\/-]{0,200}$/.test(dir) && !dir.split('/').some((seg) => seg === '..' || seg === '.');
+}
 
 const PORT = Number(process.env.PORT) || 3000;
 const WORKSPACE_STORE_PATH = path.resolve(process.cwd(), '.symvibe-workspace.json');
@@ -211,12 +275,14 @@ app.post('/api/gateway/github-sync', async (req, res) => {
   const { repoUrl = 'https://github.com/dev4-gpt/local-AgenticOS', branch = 'main' } = req.body || {};
   checkAndRecordRateLimit('codex');
 
-  const match = String(repoUrl).match(/github\.com\/([^/]+)\/([^/.\s]+)/i);
-  const owner = match?.[1] || 'dev4-gpt';
-  const repo = match?.[2] || 'local-AgenticOS';
+  const parsed = parseGithubRepo(repoUrl);
+  if (!parsed || !isSafeBranchName(branch)) {
+    return res.status(400).json({ error: 'repoUrl must look like https://github.com/owner/repo and branch must be a plain branch name.' });
+  }
+  const { owner, repo } = parsed;
 
   try {
-    const treeResp = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, {
+    const treeResp = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`, {
       headers: {
         Accept: 'application/vnd.github.v3+json',
         'User-Agent': 'Symvibe-AgenticOS-Gateway',
@@ -354,14 +420,9 @@ app.post('/api/rea/inspect', async (req, res) => {
 
   if (targetType === 'url' && /^https?:\/\//i.test(String(targetInput).trim())) {
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 4500);
-      const urlRes = await fetch(String(targetInput).trim(), {
-        signal: controller.signal,
-        headers: { 'User-Agent': 'REA-MCP-Inspector/1.0' },
-      });
-      clearTimeout(timeout);
-      const htmlText = (await urlRes.text()).slice(0, 6000);
+      // Only public web addresses are fetched; redirects are re-checked and the body is capped (see netguard.ts).
+      const urlRes = await fetchPublic(String(targetInput).trim());
+      const htmlText = urlRes.text.slice(0, 6000);
       deterministicSource += `::HTTP_${urlRes.status}::${htmlText.slice(0, 1500)}`;
 
       const serverHeader = urlRes.headers.get('server') || urlRes.headers.get('x-powered-by') || 'standard-edge';
@@ -920,9 +981,20 @@ app.post('/api/gateway/github-push', async (req, res) => {
     });
   }
 
-  const match = String(repoUrl).match(/github\.com\/([^/]+)\/([^/.\s]+)/i);
-  const owner = match?.[1] || 'dev4-gpt';
-  const repo = match?.[2] || 'local-AgenticOS';
+  const parsed = parseGithubRepo(repoUrl);
+  if (!parsed) {
+    return res.status(400).json({ error: 'repoUrl must look like https://github.com/owner/repo.' });
+  }
+  const { owner, repo } = parsed;
+  if (!GITHUB_ALLOWED_REPOS.includes(`${owner}/${repo}`.toLowerCase())) {
+    return res.status(403).json({ error: `Pushing to ${owner}/${repo} is not allowed. Allowed: ${GITHUB_ALLOWED_REPOS.join(', ')} (GITHUB_ALLOWED_REPOS).` });
+  }
+  if (!isSafeBranchName(branch) || !String(branch).startsWith(GITHUB_PUSH_BRANCH_PREFIX)) {
+    return res.status(400).json({ error: `Branch must be a plain name starting with "${GITHUB_PUSH_BRANCH_PREFIX}". The default branch is never pushed to.` });
+  }
+  if (!isSafeSubdir(targetSubdir)) {
+    return res.status(400).json({ error: 'targetSubdir must be a relative folder path without "..".' });
+  }
   const ghHeaders = {
     Authorization: `Bearer ${token}`,
     Accept: 'application/vnd.github.v3+json',
@@ -938,6 +1010,9 @@ app.post('/api/gateway/github-push', async (req, res) => {
     }
     const repoInfo: any = await repoRes.json();
     const defaultBranch = repoInfo.default_branch || 'main';
+    if (branch === defaultBranch) {
+      return res.status(400).json({ error: `Refusing to push to the default branch (${defaultBranch}).` });
+    }
 
     const refRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${defaultBranch}`, {
       headers: ghHeaders,
